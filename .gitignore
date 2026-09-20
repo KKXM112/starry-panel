@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+# 构建产物
+dist/
+*.exe
+*.test
+# 数据
+data/
+*.db
+*.db-shm
+*.db-wal
+# 环境
+.env
+.env.local
+# 系统
+.DS_Store
+Thumbs.db
+# 图标预览
+images/logo.png
