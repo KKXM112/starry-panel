@@ -1,0 +1,468 @@
+package service
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+
+	"starry-panel/config"
+	"starry-panel/database"
+	"starry-panel/model"
+)
+
+const defaultPythonRuntimeVersion = "3.12"
+
+var allPythonRuntimeVersions = []string{"3.10", "3.11", "3.12"}
+
+type PythonRuntimeInfo struct {
+	Version     string `json:"version"`
+	Label       string `json:"label"`
+	Default     bool   `json:"default"`
+	VenvPath    string `json:"venv_path"`
+	VenvHealthy bool   `json:"venv_healthy"`
+	PythonPath  string `json:"python_path"`
+	PipPath     string `json:"pip_path"`
+	Available   bool   `json:"available"`
+	Message     string `json:"message"`
+}
+
+func SupportedPythonVersions() []string {
+	return CurrentPythonRuntimeVersions()
+}
+
+func CurrentPythonRuntimeVersions() []string {
+	version, single := SinglePythonRuntimeVersion()
+	if single {
+		return []string{version}
+	}
+	return append([]string(nil), allPythonRuntimeVersions...)
+}
+
+func SinglePythonRuntimeVersion() (string, bool) {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("STARRY_PYTHON_RUNTIME_MODE")))
+	if mode != "single" {
+		return "", false
+	}
+
+	rawVersion := strings.TrimSpace(os.Getenv("STARRY_PYTHON_VERSION"))
+	if rawVersion == "" {
+		return defaultPythonRuntimeVersion, true
+	}
+	value := strings.ToLower(rawVersion)
+	value = strings.TrimPrefix(value, "python")
+	value = strings.TrimPrefix(value, "py")
+	value = strings.TrimSpace(value)
+	switch value {
+	case "3.10", "310":
+		return "3.10", true
+	case "3.11", "311":
+		return "3.11", true
+	case "3", "3.12", "312":
+		return "3.12", true
+	default:
+		return defaultPythonRuntimeVersion, true
+	}
+}
+
+func PythonVersionSupportedByCurrentRuntime(version string) bool {
+	version = NormalizePythonVersionOrDefault(version)
+	for _, candidate := range CurrentPythonRuntimeVersions() {
+		if candidate == version {
+			return true
+		}
+	}
+	return false
+}
+
+// 模块版（Magisk / KernelSU / APatch）目前通常只有一个系统 python3，
+// 不一定真的同时具备 3.10 / 3.11 / 3.12 三套解释器。
+// v2.2.19 之后默认 Python 版本固定走 3.12，多版本逻辑在 Docker / Windows 没问题，
+// 但在模块版里会把所有历史任务都打成“Python 3.12 不可用”。
+//
+// 这里把“模块运行态”的判断提到 service 层，供 Python 版本决策直接复用，
+// 避免只在 handler / shell 脚本里知道自己是模块版，真正执行任务时却还按通用服务器逻辑硬判 3.12。
+func IsMagiskModuleRuntime() bool {
+	if strings.TrimSpace(os.Getenv("STARRY_MAGISK_MODULE")) != "" {
+		return true
+	}
+	for _, marker := range []string{
+		"/data/adb/starry-panel/ports.conf",
+		"/data/adb/modules/starry-panel/module.prop",
+		"/data/adb/modules_update/starry-panel/module.prop",
+	} {
+		if _, err := os.Stat(marker); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveEffectivePythonVersionForCurrentRuntime(raw string) string {
+	requested := NormalizePythonVersionOrDefault(raw)
+	version, fellBack := resolvePythonFallbackVersion(
+		requested,
+		CurrentPythonRuntimeVersions(),
+		func(v string) bool { return discoverSystemPythonForVersion(v) != "" },
+	)
+	if fellBack {
+		// 回退实际发生，记录 panel 日志，便于用户理解任务为何改用了其它 Python 版本。
+		log.Printf("任务请求 Python %s 未安装，已回退到 %s", requested, version)
+	}
+	return version
+}
+
+// resolvePythonFallbackVersion 决定运行时最终使用的 Python 小版本。
+// 核心不变量：请求版本只要已安装(probe 命中)就绝不回退，始终尊重请求版本；
+// 只有请求版本探测不到、且受支持集合里另有已装版本时，才回退到那个已装版本。
+// 单版本运行时(Docker 固定版本)受支持集合只含一个版本，因此永远不会回退到别的版本，语义安全。
+// 桌面/二进制版与 Magisk 版共用本函数，回退行为一致。
+// probe 抽为参数便于单测注入，避免真实 exec 探测；返回 (最终版本, 是否发生回退)。
+func resolvePythonFallbackVersion(requested string, supported []string, probe func(string) bool) (string, bool) {
+	if probe(requested) {
+		return requested, false
+	}
+	for _, candidate := range supported {
+		if candidate == requested {
+			continue
+		}
+		if probe(candidate) {
+			return candidate, true
+		}
+	}
+	return requested, false
+}
+
+func LegacyPythonVersion() string {
+	return defaultPythonRuntimeVersion
+}
+
+func NormalizeDependencyPythonVersion(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return LegacyPythonVersion()
+	}
+	return NormalizePythonVersionOrDefault(raw)
+}
+
+func NormalizePythonVersionStrict(raw string) (string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	value = strings.TrimPrefix(value, "python")
+	value = strings.TrimPrefix(value, "py")
+	value = strings.TrimSpace(value)
+	switch value {
+	case "", "3", "3.12", "312":
+		if value == "" {
+			return DefaultPythonVersion(), nil
+		}
+		return "3.12", nil
+	case "3.10", "310":
+		return "3.10", nil
+	case "3.11", "311":
+		return "3.11", nil
+	default:
+		return "", fmt.Errorf("Python 版本仅支持 3.10、3.11、3.12")
+	}
+}
+
+func NormalizePythonVersionOrDefault(raw string) string {
+	version, err := NormalizePythonVersionStrict(raw)
+	if err != nil || strings.TrimSpace(version) == "" {
+		return defaultPythonRuntimeVersion
+	}
+	return version
+}
+
+func DefaultPythonVersion() string {
+	if version, single := SinglePythonRuntimeVersion(); single {
+		return resolveEffectivePythonVersionForCurrentRuntime(version)
+	}
+
+	raw := ""
+	if config.C != nil && config.C.Data.Dir != "" && database.DB != nil {
+		raw = model.GetRegisteredConfig("python_default_version")
+	}
+	if strings.TrimSpace(raw) == "" {
+		return resolveEffectivePythonVersionForCurrentRuntime(defaultPythonRuntimeVersion)
+	}
+	version, err := NormalizePythonVersionStrict(raw)
+	if err != nil || version == "" {
+		return resolveEffectivePythonVersionForCurrentRuntime(defaultPythonRuntimeVersion)
+	}
+	return resolveEffectivePythonVersionForCurrentRuntime(version)
+}
+
+func ResolvePythonVersionFromEnv(envVars map[string]string) string {
+	if envVars == nil {
+		return DefaultPythonVersion()
+	}
+	version := resolveEffectivePythonVersionForCurrentRuntime(envVars["STARRY_PYTHON_VERSION"])
+	if !PythonVersionSupportedByCurrentRuntime(version) {
+		return DefaultPythonVersion()
+	}
+	return version
+}
+
+func ResolvePythonVersionFromInterpreter(interpreter string) string {
+	value := strings.ToLower(strings.TrimSpace(interpreter))
+	switch value {
+	case "python3.10":
+		return "3.10"
+	case "python3.11":
+		return "3.11"
+	case "python3.12":
+		return "3.12"
+	default:
+		return ""
+	}
+}
+
+func IsPythonInterpreter(interpreter string) bool {
+	switch strings.ToLower(strings.TrimSpace(interpreter)) {
+	case "python", "python3", "python3.10", "python3.11", "python3.12":
+		return true
+	default:
+		return false
+	}
+}
+
+func ManagedPythonVenvDir(version string) string {
+	version = NormalizePythonVersionOrDefault(version)
+	dataDir := ""
+	if config.C != nil {
+		dataDir = config.C.Data.Dir
+	}
+	pythonDir := filepath.Join(dataDir, "deps", "python")
+	return filepath.Join(pythonDir, version)
+}
+
+func legacyManagedPythonVenvDir() string {
+	dataDir := ""
+	if config.C != nil {
+		dataDir = config.C.Data.Dir
+	}
+	return filepath.Join(dataDir, "deps", "python", "venv")
+}
+
+func NormalizeLegacyPythonVersionColumns(version string) {
+	if database.DB == nil {
+		return
+	}
+
+	version = NormalizePythonVersionOrDefault(version)
+	if err := database.DB.Exec("UPDATE dependencies SET python_version = ? WHERE type = ? AND (python_version IS NULL OR python_version = '')", version, model.DepTypePython).Error; err != nil {
+		log.Printf("warn: failed to normalize legacy python dependency versions: %v", err)
+	}
+	if err := database.DB.Exec("UPDATE tasks SET python_version = ? WHERE python_version IS NULL OR python_version = ''", version).Error; err != nil {
+		log.Printf("warn: failed to normalize legacy task python versions: %v", err)
+	}
+}
+
+func NormalizeLegacyPythonVersionColumnsAfterVenvMigration(migration LegacyPythonVenvMigration) {
+	version := NormalizePythonVersionOrDefault(migration.Version)
+	NormalizeLegacyPythonVersionColumns(version)
+
+	if !migration.MigratedRoot || version == defaultPythonRuntimeVersion || migration.DefaultVersionExisted || database.DB == nil {
+		return
+	}
+
+	if err := database.DB.Exec("UPDATE dependencies SET python_version = ? WHERE type = ? AND python_version = ?", version, model.DepTypePython, defaultPythonRuntimeVersion).Error; err != nil {
+		log.Printf("warn: failed to move legacy python dependency records to detected version %s: %v", version, err)
+	}
+	if err := database.DB.Exec("UPDATE tasks SET python_version = ? WHERE python_version = ?", version, defaultPythonRuntimeVersion).Error; err != nil {
+		log.Printf("warn: failed to move legacy python task records to detected version %s: %v", version, err)
+	}
+	if strings.TrimSpace(model.GetRegisteredConfig("python_default_version")) == defaultPythonRuntimeVersion {
+		if err := model.SetConfig("python_default_version", version); err != nil {
+			log.Printf("warn: failed to update default python version to detected legacy version %s: %v", version, err)
+		}
+	}
+}
+
+func ApplySinglePythonRuntimePolicyOnStartup() {
+	version, single := SinglePythonRuntimeVersion()
+	if !single || database.DB == nil {
+		return
+	}
+
+	// 单版本 Docker 镜像只保留一个 Python 小版本。旧版 latest 曾经内置三套 Python，
+	// 用户升级到新的 single 镜像后，需要把系统默认值和任务显式版本统一切回镜像版本，
+	// 否则历史任务仍可能指向已被删除的 3.10 / 3.11 环境。
+	if err := model.SetConfig("python_default_version", version); err != nil {
+		log.Printf("warn: failed to reset python_default_version to image runtime %s: %v", version, err)
+	}
+	if err := database.DB.Model(&model.Task{}).
+		Where("python_version IS NULL OR python_version = '' OR python_version <> ?", version).
+		Update("python_version", version).Error; err != nil {
+		log.Printf("warn: failed to reset task python versions to image runtime %s: %v", version, err)
+	}
+}
+
+// magiskPythonInterpreterProbeFunc 判断某个 Python 小版本在当前容器里是否真有解释器。
+// 抽成包级变量只为让模块版迁移的单测注入假探测：真实探测会 exec `python3.X --version`，
+// 结果跟着宿主机走（CI 自带 python3.12、纯净构建容器里一个都没有），同一个用例两边结论会相反。
+var magiskPythonInterpreterProbeFunc = func(version string) bool {
+	return discoverSystemPythonForVersion(version) != ""
+}
+
+// ApplyMagiskPythonRuntimeMigrationOnStartup 把模块版里「解释器已经不存在的 Python 小版本」
+// 名下的依赖记录、任务和默认版本，搬到容器当前的真实小版本上。
+//
+// 背景：Magisk Alpine 版的 rootfs 从 3.18（python3 = 3.11）换到 3.23（python3 = 3.12），
+// 刷模块会重装 rootfs，但数据库与 deps 目录原样回填。运行时回退只解决了「任务挑得到解释器」，
+// 依赖记录仍挂在 3.11 上：启动校验判缺失后按 3.11 重装必然报「Python 3.11 不可用」；
+// 任务回退到 3.12 后，3.12 的 venv 又是空的，照样 ModuleNotFoundError。
+//
+// 判定刻意保守，宁可漏搬也不误搬：
+//   - 只在模块运行态生效。Docker / Windows / 普通 Linux 上用户显式选的版本一律不碰；
+//   - 当前版本只认 service.sh 按真实 python3 导出的 STARRY_PYTHON_VERSION，而且必须真能探测到解释器，
+//     否则说明容器本身不健康，这时搬数据只会把记录搬到另一个同样用不了的版本上；
+//   - 只迁比当前版本旧的小版本，而且它的解释器必须确实不存在（例如 3.12 容器里用户自己装回了 python3.11 就原样保留）；
+//   - 比当前版本新的小版本一律不动。模块版的当前版本只会因为 rootfs 升级而变新；反过来，Debian 版 python3 仍是 3.11，
+//     InitDefaultConfigs 写入的默认值 3.12、以及用户选了 3.12 的任务与依赖，都可以靠一键安装 Python 3.12 补回来——
+//     若在补回之前就把它们迁到 3.11，装上 3.12 之后 3.11 解释器还在，就再也迁不回去了。
+//
+// 每次启动都按条件执行，不打「已迁移」标记：前端运行时列表仍会列出 3.10 / 3.11，
+// 用户之后照样能提交旧版本的依赖，一次性标记挡不住这条写入路径。条件不满足时一条都不改，重复执行无副作用。
+//
+// 只改 python_version，不动 status：搬过来的记录由随后的 MergeDuplicatePythonDependencies 合并同名重复，
+// 仍标着 installed 的再由 ReconcileDependenciesAfterRestart 发现当前版本 venv 里没有而排队重装。
+// 旧的 deps/python/<旧版本> 目录不删，留着便于刷回旧版模块。
+func ApplyMagiskPythonRuntimeMigrationOnStartup() {
+	if database.DB == nil || !IsMagiskModuleRuntime() {
+		return
+	}
+
+	current := strings.TrimSpace(os.Getenv("STARRY_PYTHON_VERSION"))
+	if !slices.Contains(allPythonRuntimeVersions, current) {
+		return
+	}
+	if !magiskPythonInterpreterProbeFunc(current) {
+		return
+	}
+
+	// allPythonRuntimeVersions 按升序排列（有单测守着），遇到当前版本就停：只处理比它旧的版本。
+	for _, version := range allPythonRuntimeVersions {
+		if version == current {
+			break
+		}
+		if magiskPythonInterpreterProbeFunc(version) {
+			continue
+		}
+		migrateMagiskPythonVersionRecords(version, current)
+	}
+}
+
+// migrateMagiskPythonVersionRecords 把 from 版本名下的记录改到 to 版本。
+// 用裸 SQL 而不是 Model().Update：后者会顺手刷新 updated_at，
+// 合并同名重复依赖时「最近更新」是挑保留行的依据之一，迁移本身不该改变那个判断。
+// 匹配只认精确的版本字符串：写入路径都会先归一化，宁可漏掉脏值，也不去猜它原本指哪个版本。
+func migrateMagiskPythonVersionRecords(from, to string) {
+	var depCount, taskCount int64
+
+	depResult := database.DB.Exec("UPDATE dependencies SET python_version = ? WHERE type = ? AND python_version = ?", to, model.DepTypePython, from)
+	if depResult.Error != nil {
+		log.Printf("warn: 模块版 Python 迁移：依赖记录从 %s 改到 %s 失败: %v", from, to, depResult.Error)
+	} else {
+		depCount = depResult.RowsAffected
+	}
+
+	taskResult := database.DB.Exec("UPDATE tasks SET python_version = ? WHERE python_version = ?", to, from)
+	if taskResult.Error != nil {
+		log.Printf("warn: 模块版 Python 迁移：任务从 %s 改到 %s 失败: %v", from, to, taskResult.Error)
+	} else {
+		taskCount = taskResult.RowsAffected
+	}
+
+	defaultMoved := false
+	if strings.TrimSpace(model.GetRegisteredConfig("python_default_version")) == from {
+		if err := model.SetConfig("python_default_version", to); err != nil {
+			log.Printf("warn: 模块版 Python 迁移：默认 Python 版本从 %s 改到 %s 失败: %v", from, to, err)
+		} else {
+			defaultMoved = true
+		}
+	}
+
+	if depCount == 0 && taskCount == 0 && !defaultMoved {
+		return
+	}
+	defaultNote := "未涉及默认版本"
+	if defaultMoved {
+		defaultNote = "默认 Python 版本已一并切换"
+	}
+	log.Printf("模块版 Python 迁移：容器里已没有 Python %s 解释器，已迁到当前 Python %s：依赖记录 %d 条、任务 %d 条，%s（同名依赖随后合并，缺失的依赖由启动校验自动重装）",
+		from, to, depCount, taskCount, defaultNote)
+}
+
+func PythonRuntimeInfos() []PythonRuntimeInfo {
+	defaultVersion := DefaultPythonVersion()
+	versions := CurrentPythonRuntimeVersions()
+	infos := make([]PythonRuntimeInfo, 0, len(versions))
+	for _, version := range versions {
+		venvDir := ManagedPythonVenvDir(version)
+		info := PythonRuntimeInfo{
+			Version:     version,
+			Label:       "Python " + version,
+			Default:     version == defaultVersion,
+			VenvPath:    venvDir,
+			VenvHealthy: managedPythonVenvHealthyForVersion(venvDir, version),
+		}
+		if info.VenvHealthy {
+			info.PythonPath = resolveManagedPythonBinaryInVenv(venvDir)
+			info.PipPath = resolveManagedPipBinaryInVenv(venvDir)
+			info.Available = true
+			info.Message = "托管环境可用"
+		} else if binary := discoverSystemPythonForVersion(version); binary != "" {
+			info.PythonPath = binary
+			info.Available = true
+			info.Message = "检测到系统解释器，首次使用时会创建独立依赖环境"
+		} else {
+			info.Message = fmt.Sprintf("未检测到 Python %s，请先在服务器安装 python%s 或 Windows py -%s", version, version, version)
+		}
+		infos = append(infos, info)
+	}
+	return infos
+}
+
+func discoverSystemPythonForVersion(version string) string {
+	for _, candidate := range managedPythonBootstrapCommandsForVersion(version) {
+		if managedBootstrapCommandMatchesVersion(candidate, version) {
+			return strings.Join(append([]string{candidate.binary}, candidate.versionArgsPrefix...), " ")
+		}
+	}
+	return ""
+}
+
+func managedBootstrapCommandMatchesVersion(candidate managedBootstrapCommand, version string) bool {
+	args := append([]string{}, candidate.versionArgsPrefix...)
+	args = append(args, "--version")
+	cmd := exec.Command(candidate.binary, args...)
+	cmd.Env = appendPythonBootstrapEnv(SanitizePipEnv(os.Environ()))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return pythonVersionOutputMatches(out, version)
+}
+
+func pythonVersionOutputMatches(out []byte, version string) bool {
+	text := strings.ToLower(strings.TrimSpace(string(out)))
+	return strings.Contains(text, "python "+version+".") || strings.Contains(text, "python "+version)
+}
+
+func windowsPythonPreferredDirsForVersion(version string) []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	suffix := strings.ReplaceAll(version, ".", "")
+	dirs := []string{
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Python", "Python"+suffix),
+		filepath.Join(os.Getenv("ProgramFiles"), "Python"+suffix),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Python"+suffix),
+	}
+	return append(dirs, windowsPythonPreferredDirs...)
+}
